@@ -1,0 +1,23 @@
+# Assignment spec (course material — not redistributed)
+DL2_HW3-2.pdf
+
+# Datasets (large / downloaded via download_data.sh)
+CUB_200_2011/
+CUB-200-Painting/
+attributes.txt
+*.tgz
+*.zip
+
+# Model checkpoints & outputs
+*.pth
+*.npy
+
+# Slurm job script & logs (cluster-specific, not part of submission)
+run_uda.sbatch
+slurm-*.out
+slurm-*.err
+
+# Python cache / notebook checkpoints
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
