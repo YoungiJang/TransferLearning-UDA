@@ -12,10 +12,12 @@ attributes.txt
 *.pth
 *.npy
 
-# Slurm job script & logs (cluster-specific, not part of submission)
+# Slurm job script, logs & run artifacts (cluster-specific, not part of submission)
 run_uda.sbatch
 slurm-*.out
 slurm-*.err
+.last_jobid
+RESULTS.txt
 
 # Python cache / notebook checkpoints
 __pycache__/
