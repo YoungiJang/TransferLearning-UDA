@@ -370,4 +370,42 @@ target 이미지 x의 예측 분포 p(x)=softmax(model(x)) 에 대해 두 가지
 - 리스크: DANN은 **학습 불안정**(적대 학습 특성). 붕괴 시 source-val 급락으로 감지 → entropy
   체크포인트(`*_pre_dann.pth`)로 롤백. λ 점진 증가로 안정화.
 
-**결과:** (실행 후 기록 예정)
+### 결과 (Job 15095, 9.5분)
+
+| Setting | 직전 best(entropy) | **DANN** | 변화 |
+|---|---|---|---|
+| C→P | 56.91% | 56.71% | -0.2%p (노이즈) |
+| P→C | 18.15% | **19.27%** | **+1.12%p** ✅ |
+
+- **P→C 향상** — 도메인 갭 큰 setting에서 feature 정렬이 효과 (예상 적중).
+- **C→P는 노이즈 수준 변화** — 이미 augmentation+IM으로 정렬돼 추가 이득 적음.
+- **정렬 성공 신호**: dom_loss가 **1.39 ≈ 2·ln2** 로 수렴 = domain classifier가 source/target을
+  못 맞힘(chance) = feature가 도메인 불변. 두 setting 모두 source-val 안정(붕괴 없음).
+
+**의사결정 (규칙 준수):** target 정확도로 단계를 고르는 것은 금지(=target 라벨 선택).
+따라서 **사전에 정한 full 파이프라인(source→pseudo→entropy→DANN)의 최종 산출물을 채택**한다.
+- C→P의 -0.2%는 run 노이즈 범위(source-val도 entropy 69.3% vs DANN 69.0%로 동등) → 골라낼 근거 없음.
+- 최종 제출 = DANN 체크포인트. (rollback 백업은 `*_pre_dann.pth`로 보존)
+
+---
+
+# 🏁 종합 결과 (Phase 2 완료)
+
+| 단계 | C→P | P→C |
+|---|---|---|
+| 베이스라인 (starter CNN) | 0.85% | 0.43% |
+| Phase 1 (ResNet18+aug+BNadapt) | 52.71% | 12.82% |
+| (a) P→C epoch↑ (underfit 해소) | — | 16.80% |
+| Phase 2-① pseudo-labeling | 54.91% | 16.80%* |
+| Phase 2-② entropy min (IM) | 56.91% | 18.15% |
+| **Phase 2-③ DANN (최종)** | **56.71%** | **19.27%** |
+
+(* pseudo는 P→C에 적용 불가 → 무효)
+
+**핵심 교훈**
+- **C→P**: source(사진)가 풍부·균형이라 강한 분류기 학습이 쉬움 → 52.7%까지 한 번에. 이후 pseudo/IM이
+  소폭 누적, DANN은 포화. 도메인 갭이 작아 정렬 이득이 빨리 한계.
+- **P→C**: source(그림 3,047장)가 작아 분류기 자체가 약함(병목). epoch↑로 underfit 해소(+4%p),
+  그 뒤엔 도메인 갭이 병목 → pseudo는 무력(confident 예측 부재)했지만 **라벨-불필요 정렬(IM, DANN)이
+  누적 효과**(+1.4, +1.1%p). 약한 모델엔 "출력/feature 정렬"이 "self-labeling"보다 유효.
+- 전반적으로 **기법마다 듣는 setting이 다름** → 무지성 스택이 아니라 진단 기반 적용이 중요했음.
