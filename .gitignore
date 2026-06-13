@@ -9,13 +9,16 @@ attributes.txt
 *.zip
 
 # Model checkpoints & outputs
+checkpoints/
 *.pth
 *.npy
 
 # Slurm job script, logs & run artifacts (cluster-specific, not part of submission)
+slurm/
 run_uda.sbatch
 slurm-*.out
 slurm-*.err
+*.bak
 .last_jobid
 RESULTS.txt
 
