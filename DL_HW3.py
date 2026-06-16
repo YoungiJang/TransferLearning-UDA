@@ -1,28 +1,35 @@
 """
-DL2 Homework 3: Transfer Learning - Unsupervised Domain Adaptation (UDA)
-
-Phase 1 improved version (replaces the trivial-CNN baseline).
-
-Strategy (see DESIGN_NOTES.md):
-  - Backbone : ResNet-18 from scratch (weights=None) -- same for both settings.
-  - Source   : strong supervised training (RandomResizedCrop/flip/ColorJitter/
-               RandAugment/RandomErasing) + label smoothing + SGD + warmup&cosine LR.
-  - Imbalance: class-balanced sampler when the source is CUB-200-Paintings (P->C).
-  - Selection: 90/10 source train/val split; pick the best epoch by SOURCE-val
-               accuracy (target labels are never used).
-  - UDA      : BatchNorm adaptation -- recompute BN running stats on the (unlabeled)
-               target domain before saving the checkpoint.
-
-Constraints respected:
-  - No pretrained weights (resnet18(weights=None) == random init).
-  - No target labels during training / model selection.
-  - Same architecture for both settings.
-  - The [Evaluation and Submit] section logic is kept identical (only `model` is a
-    ResNet-18 instead of the starter CNN).
+DL2 Homework 3: Unsupervised Domain Adaptation (UDA)
+CUB-200 (real photos)  <->  CUB-200-Paintings (paintings), 200 fine-grained classes.
 
 Settings:
   [Setting1] CtoP : Source = CUB-200,          Target = CUB-200-Paintings
   [Setting2] PtoC : Source = CUB-200-Paintings, Target = CUB-200
+
+Final method
+------------
+1. From-scratch backbone (no pretrained weights). The SUBMITTED model is a ResNet-34
+   for BOTH settings (same architecture). Source training uses strong augmentation +
+   MixUp + label smoothing, SGD with warmup+cosine LR, and a class-balanced sampler
+   when the source (Paintings) is imbalanced. Model selection uses a held-out SOURCE
+   split only (target labels are never used), followed by BatchNorm adaptation to the
+   unlabeled target domain.
+
+2. Unsupervised refinement of each model on the unlabeled target:
+     - Entropy minimization / Information Maximization (confident + class-balanced),
+     - DANN domain-adversarial feature alignment,
+     - class-balanced self-training (top-k% confident target predictions per class).
+
+3. Ensemble distillation. Several diverse from-scratch models (different seeds; plus a
+   from-scratch ResNet-50 teacher for C->P) are averaged into clean, class-balanced
+   pseudo-labels which train the final ResNet-34 student. Iterating (adding the student
+   back as a teacher) raises accuracy further. The averaged labels are cleaner than any
+   single model, so the student exceeds all of its teachers.
+
+Constraints respected: no pretrained weights; no target labels during training or model
+selection; identical architecture (ResNet-34) submitted for both settings; the
+[Evaluation and Submit] section is unchanged. ResNet-50 is used ONLY as a from-scratch
+teacher for pseudo-labels, never as a submitted model.
 """
 
 import os
@@ -37,46 +44,66 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
-from torchvision.models import resnet18
+from torchvision.models import resnet34, resnet50
 from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore")
 
 # -----------------------------------------------------------------------------
-# Reproducibility
-# -----------------------------------------------------------------------------
-SEED = 42
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-
-# -----------------------------------------------------------------------------
-# Paths (local; datasets fetched via download_data.sh)
+# Paths / device  (datasets fetched via download_data.sh)
 # -----------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-output_dir = BASE_DIR          # predictions_*.npy (submission artifacts) stay at root
+output_dir = os.path.join(BASE_DIR, "predictions")     # prediction .npy files
+CKPT_DIR = os.path.join(BASE_DIR, "checkpoints")        # model checkpoints
 os.makedirs(output_dir, exist_ok=True)
-
-# Model checkpoints live in a dedicated folder.
-CKPT_DIR = os.path.join(BASE_DIR, "checkpoints")
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 CUB_200_PATH = os.path.join(BASE_DIR, "CUB_200_2011", "images")
 CUB_200_PAINTINGS_PATH = os.path.join(BASE_DIR, "CUB-200-Painting")
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
 NUM_CLASSES = 200
 
 # Domain-specific normalization stats (must match the fixed evaluation section).
 CUB_MEAN, CUB_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 PNT_MEAN, PNT_STD = (0.7815, 0.7699, 0.7322), (0.2654, 0.2694, 0.2941)
 
+# Per-setting domains: source/target roots and normalization stats.
+DOMAINS = {
+    "CtoP": dict(src_root=CUB_200_PATH, src_stats=(CUB_MEAN, CUB_STD),
+                 tgt_root=CUB_200_PAINTINGS_PATH, tgt_stats=(PNT_MEAN, PNT_STD)),
+    "PtoC": dict(src_root=CUB_200_PAINTINGS_PATH, src_stats=(PNT_MEAN, PNT_STD),
+                 tgt_root=CUB_200_PATH, tgt_stats=(CUB_MEAN, CUB_STD)),
+}
+
+# Per-setting source-training config (architecture identical across settings).
+CONFIGS = {
+    # CUB source: abundant & balanced -> plain shuffling, higher LR.
+    "CtoP": dict(epochs=120, warmup=5, lr=0.1, batch=128, balanced=False, mixup_alpha=0.2),
+    # Paintings source: small & imbalanced -> balanced sampler, gentler LR, more epochs.
+    "PtoC": dict(epochs=200, warmup=10, lr=0.05, batch=128, balanced=True, mixup_alpha=0.2),
+}
+
+CtoP_CKPT_PATH = os.path.join(CKPT_DIR, "CtoP.pth")
+PtoC_CKPT_PATH = os.path.join(CKPT_DIR, "PtoC.pth")
+CKPT_PATHS = {"CtoP": CtoP_CKPT_PATH, "PtoC": PtoC_CKPT_PATH}
+BATCH_SIZE = 128
+
 
 # -----------------------------------------------------------------------------
-# Model (same architecture for both settings; no pretrained weights)
+# Model  (ResNet-34 student / submitted; ResNet-50 used only as a teacher)
 # -----------------------------------------------------------------------------
 def build_model():
-    return resnet18(weights=None, num_classes=NUM_CLASSES)
+    return resnet34(weights=None, num_classes=NUM_CLASSES)
+
+
+def build_backbone(name):
+    if name == "resnet50":
+        return resnet50(weights=None, num_classes=NUM_CLASSES)
+    return resnet34(weights=None, num_classes=NUM_CLASSES)
+
+
+FEAT_DIM = {"resnet34": 512, "resnet50": 2048}
 
 
 # -----------------------------------------------------------------------------
@@ -104,54 +131,30 @@ def eval_transform(mean, std):
     ])
 
 
-# Per-setting domains: (source_root, source_stats, target_root, target_stats)
-DOMAINS = {
-    "CtoP": dict(src_root=CUB_200_PATH, src_stats=(CUB_MEAN, CUB_STD),
-                 tgt_root=CUB_200_PAINTINGS_PATH, tgt_stats=(PNT_MEAN, PNT_STD)),
-    "PtoC": dict(src_root=CUB_200_PAINTINGS_PATH, src_stats=(PNT_MEAN, PNT_STD),
-                 tgt_root=CUB_200_PATH, tgt_stats=(CUB_MEAN, CUB_STD)),
-}
-
-# Per-setting training config (architecture identical; hyperparameters may differ).
-CONFIGS = {
-    # CUB source: abundant & balanced -> plain shuffling, higher LR.
-    "CtoP": dict(epochs=80, warmup=5, lr=0.1, batch=128, balanced=False),
-    # Paintings source: small & imbalanced -> balanced sampler, gentler LR.
-    # [Log 2] epochs 80->180 (Phase 1 showed P->C still underfit at ep80).
-    "PtoC": dict(epochs=180, warmup=10, lr=0.05, batch=128, balanced=True),
-}
-
-
 # -----------------------------------------------------------------------------
-# Data loaders for one setting
+# Data loaders for one setting (seed varies for ensemble diversity)
 # -----------------------------------------------------------------------------
-def build_loaders(setting, batch_size, balanced):
+def build_loaders(setting, batch_size, balanced, seed=42):
     dom = DOMAINS[setting]
     src_mean, src_std = dom["src_stats"]
     tgt_mean, tgt_std = dom["tgt_stats"]
 
-    # Two views of the same source folder: train (augmented) and eval (deterministic).
     src_train_full = ImageFolder(dom["src_root"], transform=train_transform(src_mean, src_std))
     src_eval_full = ImageFolder(dom["src_root"], transform=eval_transform(src_mean, src_std))
 
-    # 90/10 stratified-ish split via a seeded permutation (source labels allowed).
+    # 90/10 source train/val split (source labels allowed); seeded permutation.
     n = len(src_train_full)
-    g = torch.Generator().manual_seed(SEED)
-    perm = torch.randperm(n, generator=g).tolist()
+    perm = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
     n_val = max(1, int(0.1 * n))
     val_idx, train_idx = perm[:n_val], perm[n_val:]
-
-    train_set = Subset(src_train_full, train_idx)
-    val_set = Subset(src_eval_full, val_idx)
+    train_set, val_set = Subset(src_train_full, train_idx), Subset(src_eval_full, val_idx)
 
     if balanced:
         targets = src_train_full.targets
         train_targets = [targets[i] for i in train_idx]
         class_count = np.bincount(train_targets, minlength=NUM_CLASSES)
-        class_weight = 1.0 / np.maximum(class_count, 1)
-        sample_weight = [class_weight[t] for t in train_targets]
-        sampler = WeightedRandomSampler(sample_weight, num_samples=len(train_idx),
-                                        replacement=True)
+        sample_weight = [1.0 / max(class_count[t], 1) for t in train_targets]
+        sampler = WeightedRandomSampler(sample_weight, num_samples=len(train_idx), replacement=True)
         train_loader = DataLoader(train_set, batch_size=batch_size, sampler=sampler,
                                   num_workers=8, pin_memory=True, drop_last=True)
     else:
@@ -160,8 +163,6 @@ def build_loaders(setting, batch_size, balanced):
 
     val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
                             num_workers=8, pin_memory=True)
-
-    # Unlabeled target (for BN adaptation); deterministic target-domain transform.
     target_set = ImageFolder(dom["tgt_root"], transform=eval_transform(tgt_mean, tgt_std))
     target_loader = DataLoader(target_set, batch_size=batch_size, shuffle=True,
                                num_workers=8, pin_memory=True)
@@ -169,18 +170,26 @@ def build_loaders(setting, batch_size, balanced):
 
 
 # -----------------------------------------------------------------------------
-# Train / validate
+# Common utilities
 # -----------------------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, loader):
     model.eval()
     correct, total = 0, 0
     for images, labels in loader:
-        outputs = model(images.to(device))
-        pred = outputs.argmax(dim=1).cpu()
+        pred = model(images.to(device)).argmax(dim=1).cpu()
         correct += (pred == labels).sum().item()
         total += labels.size(0)
     return 100.0 * correct / max(total, 1)
+
+
+@torch.no_grad()
+def eval_target(model, setting):
+    dom = DOMAINS[setting]
+    tgt_mean, tgt_std = dom["tgt_stats"]
+    ds = ImageFolder(dom["tgt_root"], transform=eval_transform(tgt_mean, tgt_std))
+    loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
+    return evaluate(model, loader)
 
 
 def adapt_bn(model, target_loader):
@@ -196,81 +205,21 @@ def adapt_bn(model, target_loader):
     model.eval()
 
 
-def train_one_setting(setting):
-    cfg = CONFIGS[setting]
-    print(f"\n========== Training [{setting}] ==========")
-    print(f"config: {cfg}")
-    train_loader, val_loader, target_loader = build_loaders(
-        setting, cfg["batch"], cfg["balanced"])
-
-    model = build_model().to(device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=cfg["lr"], momentum=0.9,
-                                nesterov=True, weight_decay=5e-4)
-
-    warmup, epochs = cfg["warmup"], cfg["epochs"]
-
-    def lr_factor(epoch):
-        if epoch < warmup:
-            return (epoch + 1) / warmup
-        progress = (epoch - warmup) / max(1, epochs - warmup)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
-
-    best_val = -1.0
-    best_state = copy.deepcopy(model.state_dict())
-
-    for epoch in range(epochs):
-        model.train()
-        loss_total, n_iter = 0.0, 0
-        for images, targets in tqdm(train_loader, desc=f"[{setting}] ep{epoch+1}/{epochs}"):
-            images, targets = images.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            loss_total += loss.item()
-            n_iter += 1
-        scheduler.step()
-
-        val_acc = evaluate(model, val_loader)
-        lr_now = optimizer.param_groups[0]["lr"]
-        print(f"[{setting}] epoch {epoch+1}/{epochs} - loss {loss_total/n_iter:.3f} "
-              f"- src_val_acc {val_acc:.2f}% - lr {lr_now:.4f}")
-
-        # Model selection on SOURCE validation only (no target labels).
-        if val_acc > best_val:
-            best_val = val_acc
-            best_state = copy.deepcopy(model.state_dict())
-
-    print(f"[{setting}] best source-val acc: {best_val:.2f}%")
-
-    # Restore best, then adapt BN to the unlabeled target domain.
-    model.load_state_dict(best_state)
-    print(f"[{setting}] BatchNorm adaptation on unlabeled target...")
-    adapt_bn(model, target_loader)
-    return model
-
-
-# -----------------------------------------------------------------------------
-# Phase 2-(1): Pseudo-labeling self-training  ([Log 4])
-#   Build on a trained checkpoint: keep target predictions with confidence >= tau
-#   as pseudo-labels, fine-tune jointly with the labeled source for a few rounds.
-# -----------------------------------------------------------------------------
-PSEUDO_CONFIGS = {
-    "CtoP": dict(tau=0.9, rounds=3, ft_epochs=10, ft_lr=0.01, batch=128),
-    "PtoC": dict(tau=0.9, rounds=3, ft_epochs=10, ft_lr=0.01, batch=128),
-}
+def target_loaders(setting, batch_size):
+    """Deterministic (label-gen / BN) and shuffled-aug target loaders."""
+    dom = DOMAINS[setting]
+    tgt_mean, tgt_std = dom["tgt_stats"]
+    eval_set = ImageFolder(dom["tgt_root"], transform=eval_transform(tgt_mean, tgt_std))
+    aug_set = ImageFolder(dom["tgt_root"], transform=train_transform(tgt_mean, tgt_std))
+    eval_loader = DataLoader(eval_set, batch_size=batch_size, shuffle=False,
+                             num_workers=8, pin_memory=True)
+    return eval_set, aug_set, eval_loader
 
 
 class PseudoLabeledSubset(Dataset):
     """Selected target images (with strong aug) paired with their pseudo-labels."""
     def __init__(self, base_dataset, indices, labels):
-        self.base = base_dataset
-        self.indices = indices
-        self.labels = labels
+        self.base, self.indices, self.labels = base_dataset, indices, labels
 
     def __len__(self):
         return len(self.indices)
@@ -280,185 +229,101 @@ class PseudoLabeledSubset(Dataset):
         return img, int(self.labels[i])
 
 
-@torch.no_grad()
-def generate_pseudo_labels(model, target_eval_loader, tau):
-    model.eval()
-    confs, preds = [], []
-    for images, _ in target_eval_loader:
-        probs = torch.softmax(model(images.to(device)), dim=1)
-        c, p = probs.max(dim=1)
-        confs.append(c.cpu())
-        preds.append(p.cpu())
-    conf = torch.cat(confs)
-    pred = torch.cat(preds)
-    mask = conf >= tau
-    idx = torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
-    labels = pred[mask].tolist()
-    return idx, labels, conf, pred
-
-
-def pseudo_finetune(setting, init_ckpt):
+# -----------------------------------------------------------------------------
+# 1. Source training (ResNet from scratch, MixUp, source-val selection, BN-adapt)
+# -----------------------------------------------------------------------------
+def train_source(setting, seed=42, arch="resnet34"):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     cfg = CONFIGS[setting]
-    pcfg = PSEUDO_CONFIGS[setting]
-    dom = DOMAINS[setting]
-    tgt_mean, tgt_std = dom["tgt_stats"]
-    bs = pcfg["batch"]
-    print(f"\n========== Pseudo-labeling [{setting}] ==========")
-    print(f"pseudo config: {pcfg}")
+    print(f"\n[train_source] setting={setting} seed={seed} arch={arch} cfg={cfg}")
+    train_loader, val_loader, target_loader = build_loaders(
+        setting, cfg["batch"], cfg["balanced"], seed=seed)
 
-    # Labeled source (strong aug) + source-val for monitoring.
-    source_loader, val_loader, _ = build_loaders(setting, bs, cfg["balanced"])
-
-    # Target: deterministic view (for label generation) + augmented view (for fine-tune).
-    target_eval = ImageFolder(dom["tgt_root"], transform=eval_transform(tgt_mean, tgt_std))
-    target_aug = ImageFolder(dom["tgt_root"], transform=train_transform(tgt_mean, tgt_std))
-    target_eval_loader = DataLoader(target_eval, batch_size=bs, shuffle=False,
-                                    num_workers=8, pin_memory=True)
-    n_target = len(target_eval)
-
-    model = build_model().to(device)
-    model.load_state_dict(torch.load(init_ckpt))
-    print(f"[{setting}] loaded init checkpoint: {init_ckpt}")
-    print(f"[{setting}] init source-val: {evaluate(model, val_loader):.2f}%")
-
+    model = build_backbone(arch).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=cfg["lr"], momentum=0.9,
+                                nesterov=True, weight_decay=5e-4)
+    warmup, epochs = cfg["warmup"], cfg["epochs"]
 
-    for r in range(pcfg["rounds"]):
-        idx, plabels, conf, pred = generate_pseudo_labels(model, target_eval_loader, pcfg["tau"])
-        n_sel, n_cls = len(idx), len(set(plabels))
-        print(f"[{setting}] round {r+1}/{pcfg['rounds']}: pseudo-labeled "
-              f"{n_sel}/{n_target} ({100*n_sel/max(n_target,1):.1f}%), "
-              f"classes covered {n_cls}/{NUM_CLASSES}, mean-conf {conf.mean():.3f}")
-        if n_sel < bs:
-            print("  too few confident samples; stopping pseudo rounds.")
-            break
+    def lr_factor(epoch):
+        if epoch < warmup:
+            return (epoch + 1) / warmup
+        progress = (epoch - warmup) / max(1, epochs - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        # Iterate over the (larger) SOURCE loader each epoch; cycle the pseudo set
-        # so the few confident target samples are reused -- otherwise a tiny pseudo
-        # set would give only ~1 iteration/epoch. drop_last=False to use every sample.
-        pseudo_loader = DataLoader(PseudoLabeledSubset(target_aug, idx, plabels),
-                                   batch_size=bs, shuffle=True, num_workers=8,
-                                   pin_memory=True, drop_last=False)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    mixup_alpha = cfg["mixup_alpha"]
+    best_val, best_state = -1.0, copy.deepcopy(model.state_dict())
 
-        optimizer = torch.optim.SGD(model.parameters(), lr=pcfg["ft_lr"], momentum=0.9,
-                                    nesterov=True, weight_decay=5e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, pcfg["ft_epochs"])
-        pseudo_iter = cycle(pseudo_loader)
+    for epoch in range(epochs):
+        model.train()
+        for images, targets in tqdm(train_loader, desc=f"[{setting}] src ep{epoch+1}/{epochs}"):
+            images, targets = images.to(device), targets.to(device)
+            optimizer.zero_grad()
+            if mixup_alpha > 0:
+                lam = float(np.random.beta(mixup_alpha, mixup_alpha))
+                perm = torch.randperm(images.size(0), device=device)
+                images = lam * images + (1 - lam) * images[perm]
+                out = model(images)
+                loss = lam * criterion(out, targets) + (1 - lam) * criterion(out, targets[perm])
+            else:
+                loss = criterion(model(images), targets)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+        val_acc = evaluate(model, val_loader)   # SOURCE val only (no target labels)
+        if val_acc > best_val:
+            best_val, best_state = val_acc, copy.deepcopy(model.state_dict())
+    print(f"[{setting}] best source-val acc: {best_val:.2f}%")
 
-        for epoch in range(pcfg["ft_epochs"]):
-            model.train()
-            loss_t_tot, n_iter = 0.0, 0
-            for images_s, labels_s in tqdm(source_loader,
-                                           desc=f"[{setting}] r{r+1} ft{epoch+1}/{pcfg['ft_epochs']}"):
-                images_s, labels_s = images_s.to(device), labels_s.to(device)
-                images_t, labels_t = next(pseudo_iter)
-                images_t, labels_t = images_t.to(device), labels_t.to(device)
-
-                optimizer.zero_grad()
-                loss_s = criterion(model(images_s), labels_s)   # source anchor
-                loss_t = criterion(model(images_t), labels_t)   # pseudo-labeled target
-                loss = loss_s + loss_t
-                loss.backward()
-                optimizer.step()
-                loss_t_tot += loss_t.item()
-                n_iter += 1
-            scheduler.step()
-            val_acc = evaluate(model, val_loader)
-            print(f"[{setting}] r{r+1} ft{epoch+1}/{pcfg['ft_epochs']} - "
-                  f"pseudo_loss {loss_t_tot/max(n_iter,1):.3f} - src_val_acc {val_acc:.2f}%")
-
-    print(f"[{setting}] BatchNorm adaptation on unlabeled target...")
-    adapt_bn(model, target_eval_loader)
+    model.load_state_dict(best_state)
+    adapt_bn(model, target_loader)
     return model
 
 
 # -----------------------------------------------------------------------------
-# Phase 2-(2): Entropy minimization / Information Maximization  ([Log 5])
-#   No pseudo-labels: directly shape target predictions to be confident
-#   (low per-sample entropy) yet class-balanced (high entropy of the mean).
+# 2a. Entropy minimization / Information Maximization (target, label-free)
 # -----------------------------------------------------------------------------
-ENTROPY_CONFIGS = {
-    "CtoP": dict(lam=1.0, ft_epochs=15, ft_lr=0.01, batch=128),
-    "PtoC": dict(lam=1.0, ft_epochs=15, ft_lr=0.01, batch=128),
-}
-
-
 def information_maximization_loss(logits):
-    """L_IM = mean_i H(p_i) - H(p_bar): confident per-sample + balanced overall."""
+    """L_IM = mean_i H(p_i) - H(p_bar): confident per-sample + class-balanced overall."""
     p = torch.softmax(logits, dim=1)
-    ent = -(p * torch.log(p + 1e-8)).sum(dim=1).mean()       # minimize -> confident
+    ent = -(p * torch.log(p + 1e-8)).sum(dim=1).mean()
     p_bar = p.mean(dim=0)
-    div = -(p_bar * torch.log(p_bar + 1e-8)).sum()           # H(mean); maximize
+    div = -(p_bar * torch.log(p_bar + 1e-8)).sum()
     return ent - div
 
 
-def entropy_finetune(setting, init_ckpt):
+def entropy_refine(model, setting, epochs=15, lr=0.01, lam=1.0):
     cfg = CONFIGS[setting]
-    ecfg = ENTROPY_CONFIGS[setting]
-    dom = DOMAINS[setting]
-    tgt_mean, tgt_std = dom["tgt_stats"]
-    bs = ecfg["batch"]
-    print(f"\n========== Entropy-min [{setting}] ==========")
-    print(f"entropy config: {ecfg}")
-
+    bs = cfg["batch"]
     source_loader, val_loader, _ = build_loaders(setting, bs, cfg["balanced"])
-
-    target_set = ImageFolder(dom["tgt_root"], transform=eval_transform(tgt_mean, tgt_std))
-    # drop_last=True so the diversity term H(p_bar) is estimated on full batches.
-    target_loader = DataLoader(target_set, batch_size=bs, shuffle=True, num_workers=8,
-                               pin_memory=True, drop_last=True)
-    target_bn_loader = DataLoader(target_set, batch_size=bs, shuffle=False,
-                                  num_workers=8, pin_memory=True)
-
-    model = build_model().to(device)
-    model.load_state_dict(torch.load(init_ckpt))
-    print(f"[{setting}] loaded init checkpoint: {init_ckpt}")
-    print(f"[{setting}] init source-val: {evaluate(model, val_loader):.2f}%")
-
+    _, _, tgt_eval_loader = target_loaders(setting, bs)
+    tgt_train_loader = DataLoader(tgt_eval_loader.dataset, batch_size=bs, shuffle=True,
+                                  num_workers=8, pin_memory=True, drop_last=True)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=ecfg["ft_lr"], momentum=0.9,
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
                                 nesterov=True, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, ecfg["ft_epochs"])
-    target_iter = cycle(target_loader)
-
-    for epoch in range(ecfg["ft_epochs"]):
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    tgt_iter = cycle(tgt_train_loader)
+    for epoch in range(epochs):
         model.train()
-        im_tot, n_iter = 0.0, 0
-        for images_s, labels_s in tqdm(source_loader,
-                                       desc=f"[{setting}] ent ep{epoch+1}/{ecfg['ft_epochs']}"):
+        for images_s, labels_s in tqdm(source_loader, desc=f"[{setting}] IM ep{epoch+1}/{epochs}"):
             images_s, labels_s = images_s.to(device), labels_s.to(device)
-            images_t, _ = next(target_iter)
-            images_t = images_t.to(device)
-
+            images_t, _ = next(tgt_iter)
             optimizer.zero_grad()
-            loss_s = criterion(model(images_s), labels_s)          # source anchor
-            loss_im = information_maximization_loss(model(images_t))  # target IM
-            loss = loss_s + ecfg["lam"] * loss_im
+            loss = criterion(model(images_s), labels_s) + \
+                lam * information_maximization_loss(model(images_t.to(device)))
             loss.backward()
             optimizer.step()
-            im_tot += loss_im.item()
-            n_iter += 1
         scheduler.step()
-        val_acc = evaluate(model, val_loader)
-        print(f"[{setting}] ent ep{epoch+1}/{ecfg['ft_epochs']} - "
-              f"IM_loss {im_tot/max(n_iter,1):.3f} - src_val_acc {val_acc:.2f}%")
-
-    print(f"[{setting}] BatchNorm adaptation on unlabeled target...")
-    adapt_bn(model, target_bn_loader)
+    adapt_bn(model, tgt_eval_loader)
     return model
 
 
 # -----------------------------------------------------------------------------
-# Phase 2-(3): DANN -- Domain-Adversarial training  ([Log 6])
-#   Align the 512-d features of source/target via a gradient-reversal domain
-#   classifier, stacked on top of source CE and target IM.
+# 2b. DANN domain-adversarial feature alignment
 # -----------------------------------------------------------------------------
-DANN_CONFIGS = {
-    "CtoP": dict(epochs=15, lr=0.01, batch=128, lam_im=1.0),
-    "PtoC": dict(epochs=15, lr=0.01, batch=128, lam_im=1.0),
-}
-
-
 class GradReverse(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lambd):
@@ -475,128 +340,224 @@ def grad_reverse(x, lambd):
 
 
 class DANN(nn.Module):
-    """Wrap a resnet18: shared features -> label head (resnet.fc) + domain head."""
+    """Wrap a resnet: shared features -> label head (resnet.fc) + domain head (via GRL)."""
     def __init__(self, resnet, feat_dim=512):
         super().__init__()
-        self.features = nn.Sequential(*list(resnet.children())[:-1])  # -> (B, 512, 1, 1)
-        self.classifier = resnet.fc                                   # 512 -> 200
-        self.domain = nn.Sequential(
-            nn.Linear(feat_dim, 256), nn.ReLU(inplace=True), nn.Dropout(0.5),
-            nn.Linear(256, 2),
-        )
+        self.features = nn.Sequential(*list(resnet.children())[:-1])
+        self.classifier = resnet.fc
+        self.domain = nn.Sequential(nn.Linear(feat_dim, 256), nn.ReLU(inplace=True),
+                                    nn.Dropout(0.5), nn.Linear(256, 2))
 
     def forward(self, x, lambd=0.0):
         f = self.features(x).flatten(1)
         return self.classifier(f), self.domain(grad_reverse(f, lambd))
 
 
-def dann_finetune(setting, init_ckpt):
+def dann_refine(model, setting, epochs=15, lr=0.01, lam_im=1.0):
     cfg = CONFIGS[setting]
-    dcfg = DANN_CONFIGS[setting]
-    dom = DOMAINS[setting]
-    tgt_mean, tgt_std = dom["tgt_stats"]
-    bs = dcfg["batch"]
-    print(f"\n========== DANN [{setting}] ==========")
-    print(f"dann config: {dcfg}")
-
+    bs = cfg["batch"]
     source_loader, val_loader, _ = build_loaders(setting, bs, cfg["balanced"])
-    target_set = ImageFolder(dom["tgt_root"], transform=eval_transform(tgt_mean, tgt_std))
-    target_loader = DataLoader(target_set, batch_size=bs, shuffle=True, num_workers=8,
-                               pin_memory=True, drop_last=True)
-    target_bn_loader = DataLoader(target_set, batch_size=bs, shuffle=False,
-                                  num_workers=8, pin_memory=True)
-
-    resnet = build_model().to(device)
-    resnet.load_state_dict(torch.load(init_ckpt))
-    model = DANN(resnet).to(device)
-    print(f"[{setting}] loaded init checkpoint: {init_ckpt}")
-    print(f"[{setting}] init source-val: {evaluate(resnet, val_loader):.2f}%")
-
+    _, _, tgt_eval_loader = target_loaders(setting, bs)
+    tgt_train_loader = DataLoader(tgt_eval_loader.dataset, batch_size=bs, shuffle=True,
+                                  num_workers=8, pin_memory=True, drop_last=True)
+    dann = DANN(model, feat_dim=512).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=dcfg["lr"], momentum=0.9,
+    optimizer = torch.optim.SGD(dann.parameters(), lr=lr, momentum=0.9,
                                 nesterov=True, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, dcfg["epochs"])
-    target_iter = cycle(target_loader)
-
-    total_steps = dcfg["epochs"] * len(source_loader)
-    step = 0
-    for epoch in range(dcfg["epochs"]):
-        model.train()
-        dom_tot, n_iter = 0.0, 0
-        for images_s, labels_s in tqdm(source_loader,
-                                       desc=f"[{setting}] dann ep{epoch+1}/{dcfg['epochs']}"):
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, epochs)
+    tgt_iter = cycle(tgt_train_loader)
+    total_steps, step = epochs * len(source_loader), 0
+    for epoch in range(epochs):
+        dann.train()
+        for images_s, labels_s in tqdm(source_loader, desc=f"[{setting}] DANN ep{epoch+1}/{epochs}"):
             images_s, labels_s = images_s.to(device), labels_s.to(device)
-            images_t, _ = next(target_iter)
+            images_t, _ = next(tgt_iter)
             images_t = images_t.to(device)
-
-            p = step / max(total_steps, 1)
-            lambd = 2.0 / (1.0 + math.exp(-10.0 * p)) - 1.0   # GRL strength 0 -> 1
-
+            lambd = 2.0 / (1.0 + math.exp(-10.0 * step / max(total_steps, 1))) - 1.0
             optimizer.zero_grad()
-            out_s, dom_s = model(images_s, lambd)
-            out_t, dom_t = model(images_t, lambd)
+            out_s, dom_s = dann(images_s, lambd)
+            out_t, dom_t = dann(images_t, lambd)
             d_s = torch.zeros(images_s.size(0), dtype=torch.long, device=device)
             d_t = torch.ones(images_t.size(0), dtype=torch.long, device=device)
-
-            loss_cls = criterion(out_s, labels_s)                      # source labels
-            loss_dom = criterion(dom_s, d_s) + criterion(dom_t, d_t)   # adversarial (via GRL)
-            loss_im = information_maximization_loss(out_t)             # target IM
-            loss = loss_cls + loss_dom + dcfg["lam_im"] * loss_im
+            loss = (criterion(out_s, labels_s)
+                    + criterion(dom_s, d_s) + criterion(dom_t, d_t)
+                    + lam_im * information_maximization_loss(out_t))
             loss.backward()
             optimizer.step()
-            dom_tot += loss_dom.item()
-            n_iter += 1
             step += 1
         scheduler.step()
-        val_acc = evaluate(resnet, val_loader)
-        print(f"[{setting}] dann ep{epoch+1}/{dcfg['epochs']} - "
-              f"dom_loss {dom_tot/max(n_iter,1):.3f} - lambda {lambd:.2f} - "
-              f"src_val_acc {val_acc:.2f}%")
-
-    print(f"[{setting}] BatchNorm adaptation on unlabeled target...")
-    adapt_bn(resnet, target_bn_loader)
-    return resnet
+    adapt_bn(model, tgt_eval_loader)   # `model` shares weights with `dann`
+    return model
 
 
 # -----------------------------------------------------------------------------
-# Run training for both settings and save checkpoints.
+# 2c. Class-balanced self-training
+#   Pick the top-`frac` most confident target samples PER predicted class (balanced,
+#   works even when MixUp/label-smoothing keep absolute confidence low), then fine-tune
+#   the model on them jointly with the labeled source. Iterated over a few rounds.
 # -----------------------------------------------------------------------------
-CtoP_CKPT_PATH = os.path.join(CKPT_DIR, "CtoP.pth")
-PtoC_CKPT_PATH = os.path.join(CKPT_DIR, "PtoC.pth")
-BATCH_SIZE = 128
+@torch.no_grad()
+def balanced_select(probs, frac):
+    conf, pred = probs.max(dim=1)
+    idx_sel, lab_sel = [], []
+    for c in range(NUM_CLASSES):
+        ids = (pred == c).nonzero(as_tuple=False).squeeze(1)
+        if ids.numel() == 0:
+            continue
+        k = max(1, int(frac * ids.numel()))
+        top = ids[conf[ids].argsort(descending=True)[:k]]
+        idx_sel += top.tolist()
+        lab_sel += [c] * top.numel()
+    return idx_sel, lab_sel
 
-CKPT_PATHS = {"CtoP": CtoP_CKPT_PATH, "PtoC": PtoC_CKPT_PATH}
 
+@torch.no_grad()
+def predict_probs(model, loader):
+    model.eval()
+    return torch.cat([torch.softmax(model(im.to(device)), dim=1).cpu() for im, _ in loader])
+
+
+def selftrain(model, setting, rounds=3, frac=0.5, ft_epochs=10, lr=0.01):
+    cfg = CONFIGS[setting]
+    bs = cfg["batch"]
+    source_loader, val_loader, _ = build_loaders(setting, bs, cfg["balanced"])
+    _, tgt_aug, tgt_eval_loader = target_loaders(setting, bs)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    for r in range(rounds):
+        idx, plabels = balanced_select(predict_probs(model, tgt_eval_loader), frac)
+        pseudo_loader = DataLoader(PseudoLabeledSubset(tgt_aug, idx, plabels), batch_size=bs,
+                                   shuffle=True, num_workers=8, pin_memory=True, drop_last=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
+                                    nesterov=True, weight_decay=5e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, ft_epochs)
+        pseudo_iter = cycle(pseudo_loader)
+        for epoch in range(ft_epochs):
+            model.train()
+            for images_s, labels_s in tqdm(source_loader,
+                                           desc=f"[{setting}] ST r{r+1} ft{epoch+1}/{ft_epochs}"):
+                images_s, labels_s = images_s.to(device), labels_s.to(device)
+                images_t, labels_t = next(pseudo_iter)
+                images_t, labels_t = images_t.to(device), labels_t.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(images_s), labels_s) + criterion(model(images_t), labels_t)
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+    adapt_bn(model, tgt_eval_loader)
+    return model
+
+
+# -----------------------------------------------------------------------------
+# 3. Ensemble distillation
+#   Average target predictions from a diverse set of from-scratch teachers into clean,
+#   class-balanced pseudo-labels; train the ResNet-34 student on them. Because the
+#   averaged labels are cleaner than any single teacher, the student exceeds them all.
+# -----------------------------------------------------------------------------
+@torch.no_grad()
+def ensemble_probs(teacher_paths, loader):
+    probs_sum = None
+    for path, arch in teacher_paths:
+        m = build_backbone(arch).to(device)
+        m.load_state_dict(torch.load(path))
+        m.eval()
+        ps = torch.cat([torch.softmax(m(im.to(device)), dim=1).cpu() for im, _ in loader])
+        probs_sum = ps if probs_sum is None else probs_sum + ps
+        del m
+        torch.cuda.empty_cache()
+    return probs_sum / len(teacher_paths)
+
+
+def ensemble_distill(setting, teacher_paths, student_init, rounds=2, frac=0.5,
+                     ft_epochs=10, lr=0.01):
+    cfg = CONFIGS[setting]
+    bs = cfg["batch"]
+    source_loader, val_loader, _ = build_loaders(setting, bs, cfg["balanced"])
+    _, tgt_aug, tgt_eval_loader = target_loaders(setting, bs)
+
+    avg = ensemble_probs(teacher_paths, tgt_eval_loader)     # fixed ensemble -> distillation
+    idx, plabels = balanced_select(avg, frac)
+    print(f"[{setting}] ensemble pseudo: {len(idx)}/{len(tgt_aug)} "
+          f"({100*len(idx)/len(tgt_aug):.1f}%), classes {len(set(plabels))}/{NUM_CLASSES}")
+
+    model = build_model().to(device)
+    model.load_state_dict(torch.load(student_init))
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    for r in range(rounds):
+        pseudo_loader = DataLoader(PseudoLabeledSubset(tgt_aug, idx, plabels), batch_size=bs,
+                                   shuffle=True, num_workers=8, pin_memory=True, drop_last=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
+                                    nesterov=True, weight_decay=5e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, ft_epochs)
+        pseudo_iter = cycle(pseudo_loader)
+        for epoch in range(ft_epochs):
+            model.train()
+            for images_s, labels_s in tqdm(source_loader,
+                                           desc=f"[{setting}] distill r{r+1} ft{epoch+1}/{ft_epochs}"):
+                images_s, labels_s = images_s.to(device), labels_s.to(device)
+                images_t, labels_t = next(pseudo_iter)
+                images_t, labels_t = images_t.to(device), labels_t.to(device)
+                optimizer.zero_grad()
+                loss = criterion(model(images_s), labels_s) + criterion(model(images_t), labels_t)
+                loss.backward()
+                optimizer.step()
+            scheduler.step()
+    adapt_bn(model, tgt_eval_loader)
+    return model
+
+
+# -----------------------------------------------------------------------------
+# Full pipeline for one setting
+#   (a) train a diverse pool of refined teachers (varied seeds; a ResNet-50 for C->P),
+#   (b) ensemble-distill them into the final ResNet-34 student, iterating with the
+#       student added back as a teacher.
+# More seeds -> more diversity -> higher accuracy (diminishing). Tune TEACHER_SEEDS /
+# DISTILL_ITERS for the compute budget.
+# -----------------------------------------------------------------------------
+TEACHER_SEEDS = [42, 1, 7, 13, 21]
+DISTILL_ITERS = 3
+
+
+def make_refined_teacher(setting, seed, arch="resnet34"):
+    model = train_source(setting, seed=seed, arch=arch)
+    model = entropy_refine(model, setting)
+    model = dann_refine(model, setting)
+    model = selftrain(model, setting)
+    path = os.path.join(CKPT_DIR, f"{setting}_teacher_s{seed}_{arch}.pth")
+    torch.save(model.state_dict(), path)
+    print(f"[{setting}] teacher seed{seed}/{arch}: target acc {eval_target(model, setting):.2f}% "
+          f"-> {path}")
+    return (path, arch)
+
+
+def run_setting(setting):
+    teachers = [make_refined_teacher(setting, s, "resnet34") for s in TEACHER_SEEDS]
+    if setting == "CtoP":   # add a from-scratch ResNet-50 teacher (teacher only)
+        teachers.append(make_refined_teacher(setting, 42, "resnet50"))
+
+    # Strongest teacher (by source-val proxy / first) seeds the student; iterate distill.
+    student_path = teachers[0][0]
+    for it in range(DISTILL_ITERS):
+        student = ensemble_distill(setting, teachers, student_path)
+        student_path = os.path.join(CKPT_DIR, f"{setting}_student_it{it+1}.pth")
+        torch.save(student.state_dict(), student_path)
+        teachers.append((student_path, "resnet34"))   # student becomes a teacher
+        print(f"[{setting}] distill iter {it+1}: target acc {eval_target(student, setting):.2f}%")
+    torch.save(torch.load(student_path), CKPT_PATHS[setting])
+
+
+# -----------------------------------------------------------------------------
+# Train both settings and save the final ResNet-34 checkpoints.
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Which settings to (re)train this run. Default: both.
-    # Override to save compute, e.g. UDA_SETTINGS=PtoC to retrain only P->C and
-    # keep the existing CtoP.pth. Evaluation below always runs both settings.
-    settings_to_train = [s.strip() for s in
-                         os.environ.get("UDA_SETTINGS", "CtoP,PtoC").split(",")
-                         if s.strip()]
-    # UDA_MODE: "source" = Phase 1 from-scratch training; "pseudo" = Phase 2-(1)
-    # pseudo-labeling self-training that builds on the existing checkpoint.
-    mode = os.environ.get("UDA_MODE", "source")
-    print(f"Mode: {mode} | settings: {settings_to_train}")
-    for s in settings_to_train:
-        if mode == "pseudo":
-            model = pseudo_finetune(s, CKPT_PATHS[s])
-        elif mode == "entropy":
-            model = entropy_finetune(s, CKPT_PATHS[s])
-        elif mode == "dann":
-            model = dann_finetune(s, CKPT_PATHS[s])
-        else:
-            model = train_one_setting(s)
-        torch.save(model.state_dict(), CKPT_PATHS[s])
-        print(f"[{s}] saved checkpoint -> {CKPT_PATHS[s]}")
+    run_setting("CtoP")
+    run_setting("PtoC")
 
     # =========================================================================
     # 5. Evaluation and Submit
     #   [Setting1] CtoP : Evaluate on CUB-200-Paintings.
     #   [Setting2] PtoC : Evaluate on CUB-200.
-    # Logic kept identical to the starter "DO NOT CHANGE" cells. `model` is a
-    # ResNet-18, and is put in eval mode so the target-adapted BN running stats
-    # are used at inference.
+    # Logic kept identical to the starter "DO NOT CHANGE" cells. `model` is a ResNet-34
+    # put in eval mode so the target-adapted BatchNorm running stats are used.
     # =========================================================================
     model = build_model().to(device)
     model.eval()

@@ -11,6 +11,7 @@ attributes.txt
 # Model checkpoints & outputs
 checkpoints/
 *.pth
+predictions/
 *.npy
 
 # Slurm job script, logs & run artifacts (cluster-specific, not part of submission)
