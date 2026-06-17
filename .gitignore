@@ -27,3 +27,12 @@ RESULTS.txt
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Report PDF generation (local only)
+report_pdf.py
+*.pdf
+temp_final.html
+
+# Submission artifacts (local)
+submit/
+*.zip
