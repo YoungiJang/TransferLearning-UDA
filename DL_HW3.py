@@ -1,37 +1,3 @@
-"""
-DL2 Homework 3: Unsupervised Domain Adaptation (UDA)
-CUB-200 (real photos)  <->  CUB-200-Paintings (paintings), 200 fine-grained classes.
-
-Settings:
-  [Setting1] CtoP : Source = CUB-200,          Target = CUB-200-Paintings
-  [Setting2] PtoC : Source = CUB-200-Paintings, Target = CUB-200
-
-Final method
-------------
-1. From-scratch backbone (no pretrained weights). The SUBMITTED model is a ResNet-34
-   for BOTH settings (same architecture). Source training uses strong augmentation +
-   MixUp + label smoothing, SGD with warmup+cosine LR, and a class-balanced sampler
-   when the source (Paintings) is imbalanced. Model selection uses a held-out SOURCE
-   split only (target labels are never used), followed by BatchNorm adaptation to the
-   unlabeled target domain.
-
-2. Unsupervised refinement of each model on the unlabeled target:
-     - Entropy minimization / Information Maximization (confident + class-balanced),
-     - DANN domain-adversarial feature alignment,
-     - class-balanced self-training (top-k% confident target predictions per class).
-
-3. Ensemble distillation. Several diverse from-scratch models (different seeds; plus a
-   from-scratch ResNet-50 teacher for C->P) are averaged into clean, class-balanced
-   pseudo-labels which train the final ResNet-34 student. Iterating (adding the student
-   back as a teacher) raises accuracy further. The averaged labels are cleaner than any
-   single model, so the student exceeds all of its teachers.
-
-Constraints respected: no pretrained weights; no target labels during training or model
-selection; identical architecture (ResNet-34) submitted for both settings; the
-[Evaluation and Submit] section is unchanged. ResNet-50 is used ONLY as a from-scratch
-teacher for pseudo-labels, never as a submitted model.
-"""
-
 import os
 import math
 import copy
@@ -49,9 +15,7 @@ from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore")
 
-# -----------------------------------------------------------------------------
-# Paths / device  (datasets fetched via download_data.sh)
-# -----------------------------------------------------------------------------
+# Paths / device
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 output_dir = os.path.join(BASE_DIR, "predictions")     # prediction .npy files
 CKPT_DIR = os.path.join(BASE_DIR, "checkpoints")        # model checkpoints
@@ -64,7 +28,7 @@ CUB_200_PAINTINGS_PATH = os.path.join(BASE_DIR, "CUB-200-Painting")
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 NUM_CLASSES = 200
 
-# Domain-specific normalization stats (must match the fixed evaluation section).
+# Domain-specific normalization stats.
 CUB_MEAN, CUB_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 PNT_MEAN, PNT_STD = (0.7815, 0.7699, 0.7322), (0.2654, 0.2694, 0.2941)
 
@@ -90,9 +54,7 @@ CKPT_PATHS = {"CtoP": CtoP_CKPT_PATH, "PtoC": PtoC_CKPT_PATH}
 BATCH_SIZE = 128
 
 
-# -----------------------------------------------------------------------------
-# Model  (ResNet-34 student / submitted; ResNet-50 used only as a teacher)
-# -----------------------------------------------------------------------------
+# Model  (ResNet-34 student)
 def build_model():
     return resnet34(weights=None, num_classes=NUM_CLASSES)
 
@@ -106,9 +68,7 @@ def build_backbone(name):
 FEAT_DIM = {"resnet34": 512, "resnet50": 2048}
 
 
-# -----------------------------------------------------------------------------
 # Transforms
-# -----------------------------------------------------------------------------
 def train_transform(mean, std):
     return transforms.Compose([
         transforms.RandomResizedCrop(224, scale=(0.5, 1.0)),
@@ -131,9 +91,7 @@ def eval_transform(mean, std):
     ])
 
 
-# -----------------------------------------------------------------------------
 # Data loaders for one setting (seed varies for ensemble diversity)
-# -----------------------------------------------------------------------------
 def build_loaders(setting, batch_size, balanced, seed=42):
     dom = DOMAINS[setting]
     src_mean, src_std = dom["src_stats"]
@@ -169,9 +127,7 @@ def build_loaders(setting, batch_size, balanced, seed=42):
     return train_loader, val_loader, target_loader
 
 
-# -----------------------------------------------------------------------------
 # Common utilities
-# -----------------------------------------------------------------------------
 @torch.no_grad()
 def evaluate(model, loader):
     model.eval()
@@ -229,9 +185,7 @@ class PseudoLabeledSubset(Dataset):
         return img, int(self.labels[i])
 
 
-# -----------------------------------------------------------------------------
 # 1. Source training (ResNet from scratch, MixUp, source-val selection, BN-adapt)
-# -----------------------------------------------------------------------------
 def train_source(setting, seed=42, arch="resnet34"):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -282,9 +236,7 @@ def train_source(setting, seed=42, arch="resnet34"):
     return model
 
 
-# -----------------------------------------------------------------------------
 # 2a. Entropy minimization / Information Maximization (target, label-free)
-# -----------------------------------------------------------------------------
 def information_maximization_loss(logits):
     """L_IM = mean_i H(p_i) - H(p_bar): confident per-sample + class-balanced overall."""
     p = torch.softmax(logits, dim=1)
@@ -321,9 +273,7 @@ def entropy_refine(model, setting, epochs=15, lr=0.01, lam=1.0):
     return model
 
 
-# -----------------------------------------------------------------------------
 # 2b. DANN domain-adversarial feature alignment
-# -----------------------------------------------------------------------------
 class GradReverse(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, lambd):
@@ -390,12 +340,10 @@ def dann_refine(model, setting, epochs=15, lr=0.01, lam_im=1.0):
     return model
 
 
-# -----------------------------------------------------------------------------
 # 2c. Class-balanced self-training
 #   Pick the top-`frac` most confident target samples PER predicted class (balanced,
 #   works even when MixUp/label-smoothing keep absolute confidence low), then fine-tune
 #   the model on them jointly with the labeled source. Iterated over a few rounds.
-# -----------------------------------------------------------------------------
 @torch.no_grad()
 def balanced_select(probs, frac):
     conf, pred = probs.max(dim=1)
@@ -447,12 +395,10 @@ def selftrain(model, setting, rounds=3, frac=0.5, ft_epochs=10, lr=0.01):
     return model
 
 
-# -----------------------------------------------------------------------------
 # 3. Ensemble distillation
 #   Average target predictions from a diverse set of from-scratch teachers into clean,
 #   class-balanced pseudo-labels; train the ResNet-34 student on them. Because the
 #   averaged labels are cleaner than any single teacher, the student exceeds them all.
-# -----------------------------------------------------------------------------
 @torch.no_grad()
 def ensemble_probs(teacher_paths, loader):
     probs_sum = None
@@ -505,14 +451,12 @@ def ensemble_distill(setting, teacher_paths, student_init, rounds=2, frac=0.5,
     return model
 
 
-# -----------------------------------------------------------------------------
 # Full pipeline for one setting
 #   (a) train a diverse pool of refined teachers (varied seeds; a ResNet-50 for C->P),
 #   (b) ensemble-distill them into the final ResNet-34 student, iterating with the
 #       student added back as a teacher.
 # More seeds -> more diversity -> higher accuracy (diminishing). Tune TEACHER_SEEDS /
 # DISTILL_ITERS for the compute budget.
-# -----------------------------------------------------------------------------
 TEACHER_SEEDS = [42, 1, 7, 13, 21]
 DISTILL_ITERS = 3
 
@@ -545,9 +489,7 @@ def run_setting(setting):
     torch.save(torch.load(student_path), CKPT_PATHS[setting])
 
 
-# -----------------------------------------------------------------------------
 # Train both settings and save the final ResNet-34 checkpoints.
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     run_setting("CtoP")
     run_setting("PtoC")
